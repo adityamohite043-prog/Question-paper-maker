@@ -5,7 +5,7 @@ from docx import Document
 
 st.set_page_config(page_title="Question Paper Maker",page_icon="📝",layout="wide")
 st.title("📝 Question Paper Maker")
-st.caption("Fast public web version — cached source reading, visible unit-by-unit progress, retries, and template-based export.")
+st.caption("v2.3 — Gemini Interactions API, resilient 503 retries, saved unit progress, cached sources, and template export.")
 
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
@@ -66,32 +66,51 @@ def split_units(text):
         out.append(text[x.start():end].strip())
     return out
 
-def call_ai(prompt, attempts=3):
+def _interaction_text(data):
+    texts=[]
+    for step in data.get("steps",[]):
+        if step.get("type") != "model_output":
+            continue
+        for item in step.get("content",[]):
+            if item.get("type") == "text" and item.get("text"):
+                texts.append(item["text"])
+    if not texts:
+        raise RuntimeError(f"AI returned no text output: {str(data)[:500]}")
+    return "\n".join(texts)
+
+def call_ai(prompt, attempts=4):
     key=st.secrets.get("GEMINI_API_KEY","")
-    model=st.secrets.get("GEMINI_MODEL","gemini-3.6-flash")
+    model=st.secrets.get("GEMINI_MODEL","gemini-3.8-flash")
+    fallback=st.secrets.get("GEMINI_FALLBACK_MODEL","").strip()
     if not key:
         raise RuntimeError("Website owner has not configured the AI key.")
-    url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    payload={"contents":[{"parts":[{"text":prompt}]}],
-             "generationConfig":{"temperature":0.2,"responseMimeType":"application/json","maxOutputTokens":8192}}
+    url="https://generativelanguage.googleapis.com/v1beta/interactions"
+    headers={"x-goog-api-key":key,"Content-Type":"application/json"}
+    models=[model]+([fallback] if fallback and fallback != model else [])
     last=None
-    for attempt in range(1,attempts+1):
-        try:
-            r=requests.post(url,json=payload,timeout=(20,150))
-            if r.ok:
-                data=r.json()
-                candidates=data.get("candidates") or []
-                if not candidates:
-                    raise RuntimeError(f"AI returned no candidate: {str(data)[:400]}")
-                return candidates[0]["content"]["parts"][0]["text"]
-            last=f"AI service error {r.status_code}: {r.text[:500]}"
-            if r.status_code not in (429,500,502,503,504):
-                raise RuntimeError(last)
-        except requests.RequestException as e:
-            last=f"AI connection error: {e}"
-        if attempt < attempts:
-            time.sleep(2**attempt)
-    raise RuntimeError(last or "AI service did not respond.")
+    waits=[5,15,30]
+    for mi,current_model in enumerate(models):
+        for attempt in range(1,attempts+1):
+            payload={
+                "model":current_model,
+                "input":prompt,
+                "store":False,
+                "generation_config":{"temperature":0.2,"thinking_level":"low","max_output_tokens":8192}
+            }
+            try:
+                r=requests.post(url,headers=headers,json=payload,timeout=(20,180))
+                if r.ok:
+                    return _interaction_text(r.json())
+                last=f"AI service error {r.status_code}: {r.text[:500]}"
+                if r.status_code not in (429,500,502,503,504):
+                    raise RuntimeError(last)
+            except requests.RequestException as e:
+                last=f"AI connection error: {e}"
+            if attempt < attempts:
+                delay=waits[min(attempt-1,len(waits)-1)]
+                time.sleep(delay)
+        # Only move to an explicitly configured fallback after primary retries are exhausted.
+    raise RuntimeError(last or "AI service did not respond after retries.")
 
 def get_json(s):
     s=re.sub(r"^```(?:json)?\s*","",s.strip()); s=re.sub(r"\s*```$","",s)
@@ -304,29 +323,44 @@ with t3:
                 target=min(sets, len(papers)+(1 if next_clicked else sets-len(papers)))
                 overall=st.progress(len(papers)/max(sets,1),text="Ready")
                 for sidx in range(len(papers),target):
-                    mc=[]; desc=[]
+                    pending=st.session_state.get("pending_set")
+                    if not pending or pending.get("setno") != sidx+1:
+                        pending={"setno":sidx+1,"units":{}}
+                        st.session_state["pending_set"]=pending
                     with st.status(f"Generating Set {sidx+1}...",expanded=True) as status:
                         for i,u in enumerate(units,1):
+                            if str(i) in pending["units"]:
+                                status.write(f"Unit {i} already saved ✓")
+                                continue
                             status.write(f"Unit {i}: selecting relevant reference material...")
-                            status.write(f"Unit {i}: generating questions and solutions...")
+                            status.write(f"Unit {i}: generating with Gemini (temporary 503 errors are retried automatically)...")
                             x=generate(i,u,st.session_state["reference"],co,difficulty,used)
+                            pending["units"][str(i)]=x
+                            st.session_state["pending_set"]=pending
                             for q in x["mcqs"]:
-                                q["unit"]=i; q.setdefault("po",""); mc.append(q); used+="\n"+q["question"]
-                            desc.append(x["descriptive"])
+                                used+="\n"+q["question"]
                             for q in x["descriptive"]:
-                                q.setdefault("po",""); used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
-                            status.write(f"Unit {i} complete ✓")
+                                used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
+                            st.session_state["used_questions"]=used
+                            status.write(f"Unit {i} complete and saved ✓")
+                        mc=[]; desc=[]
+                        for i in range(1,6):
+                            x=pending["units"][str(i)]
+                            for q in x["mcqs"]:
+                                q["unit"]=i; q.setdefault("po",""); mc.append(q)
+                            desc.append(x["descriptive"])
+                            for q in x["descriptive"]: q.setdefault("po","")
                         paper={"mcqs":balance(mc),"descriptive":desc}
                         papers.append(paper)
                         st.session_state["papers"]=papers
-                        st.session_state["used_questions"]=used
+                        st.session_state.pop("pending_set",None)
                         status.update(label=f"Set {sidx+1} complete ✓",state="complete",expanded=False)
                     overall.progress(len(papers)/max(sets,1),text=f"{len(papers)} of {sets} set(s) complete")
                 st.success(f"Generation finished. {len(papers)} set(s) are ready for review.")
             except Exception as e:
                 st.error(f"Generation stopped: {e}")
                 if st.session_state.get("papers"):
-                    st.info("Already completed sets were kept. Click Generate Next Set to continue.")
+                    st.info("Completed sets and completed units of the current set were kept. Click Generate Next Set to resume from the failed unit.")
     if st.session_state.get("papers"):
 
         n=st.selectbox("Review Set",range(1,len(st.session_state["papers"])+1)); p=st.session_state["papers"][n-1]
