@@ -121,61 +121,156 @@ def make_sol_doc(paper,title,code,setno):
             r[2].text="5"; n+=1
     o=io.BytesIO(); d.save(o); return o.getvalue()
 
+
+def get_bytes(f):
+    f.seek(0)
+    return f.read()
+
+def set_cell(c, text):
+    c.text = str(text)
+
+def fill_qp_template(template_bytes, paper, meta):
+    d=Document(io.BytesIO(template_bytes))
+    if len(d.tables)<4:
+        raise ValueError("Question-paper template structure is not compatible with the current Nitte SEE format.")
+    t0,t1,t2,t3=d.tables[:4]
+    if len(t0.rows)>=2:
+        set_cell(t0.rows[0].cells[1],meta.get("setter","")); set_cell(t0.rows[0].cells[3],meta.get("set",""))
+        set_cell(t0.rows[1].cells[1],meta.get("department","")); set_cell(t0.rows[1].cells[3],meta.get("date",""))
+    if len(t1.rows)>=5:
+        set_cell(t1.rows[2].cells[0],f'{meta.get("semester","")} Semester B.Sc (CBCS) Degree Examinations')
+        set_cell(t1.rows[3].cells[0],f'Academic Year: {meta.get("year","")}')
+        set_cell(t1.rows[4].cells[0],f'{meta.get("code","")} – {meta.get("title","")} ({meta.get("scheme","")})\n(For {meta.get("branches","")})')
+    # MCQs: current SEE template uses 3 rows/question
+    for i,q in enumerate(paper["mcqs"][:50]):
+        r=i*3
+        if r+2>=len(t2.rows): break
+        set_cell(t2.rows[r].cells[0],f"{i+1}."); set_cell(t2.rows[r].cells[1],q["question"])
+        set_cell(t2.rows[r+1].cells[0],""); set_cell(t2.rows[r+1].cells[1],"A)"); set_cell(t2.rows[r+1].cells[2],q["options"]["A"]); set_cell(t2.rows[r+1].cells[3],"B)"); set_cell(t2.rows[r+1].cells[4],q["options"]["B"])
+        set_cell(t2.rows[r+2].cells[0],""); set_cell(t2.rows[r+2].cells[1],"C)"); set_cell(t2.rows[r+2].cells[2],q["options"]["C"]); set_cell(t2.rows[r+2].cells[3],"D)"); set_cell(t2.rows[r+2].cells[4],q["options"]["D"])
+    rows=[((1,2),(4,5)),((7,8),(10,11)),((13,14),(16,17)),((19,20),(22,23)),((25,26),(28,29))]
+    qn=1
+    for ui,pair in enumerate(paper["descriptive"][:5]):
+        for alt,(ra,rb) in enumerate(rows[ui]):
+            q=pair[alt]
+            for rr,part,label in [(ra,q["a"],"a)"),(rb,q["b"],"b)")]:
+                set_cell(t3.rows[rr].cells[0],str(qn) if label=="a)" else "")
+                set_cell(t3.rows[rr].cells[1],label); set_cell(t3.rows[rr].cells[2],part["question"]); set_cell(t3.rows[rr].cells[3],part["marks"])
+                set_cell(t3.rows[rr].cells[4],q.get("bt","")); set_cell(t3.rows[rr].cells[5],q.get("co","")); set_cell(t3.rows[rr].cells[6],q.get("po",""))
+            qn+=1
+    o=io.BytesIO(); d.save(o); return o.getvalue()
+
+def fill_key_template(template_bytes,paper,meta):
+    d=Document(io.BytesIO(template_bytes))
+    if not d.tables: raise ValueError("MCQ answer-key template has no table.")
+    for p in d.paragraphs:
+        if "Program:" in p.text and "Semester:" in p.text: p.text=f'Program: B.Sc    Semester: {meta.get("semester","")}    QP SET No.: {meta.get("set","")}'
+        elif "Course Code:" in p.text and "Course Title:" in p.text: p.text=f'Course Code: {meta.get("code","")}    Course Title: {meta.get("title","")}'
+        elif p.text.strip().startswith("Name of the Faculty:"): p.text=f'Name of the Faculty: {meta.get("setter","")}'
+        elif p.text.strip().startswith("Affiliation:"): p.text=f'Affiliation: {meta.get("department","")}'
+    t=d.tables[0]; ans=[q["answer"].upper() for q in paper["mcqs"][:50]]
+    for r in range(1,min(11,len(t.rows))):
+        for b in range(5):
+            n=r+b*10
+            if n<=len(ans) and b*2+1<len(t.rows[r].cells):
+                set_cell(t.rows[r].cells[b*2],f"{n}."); set_cell(t.rows[r].cells[b*2+1],ans[n-1])
+    o=io.BytesIO(); d.save(o); return o.getvalue()
+
+def fill_sol_template(template_bytes,paper,meta):
+    d=Document(io.BytesIO(template_bytes))
+    if len(d.tables)<2: raise ValueError("Scheme & Solution template structure is not compatible.")
+    h=d.tables[0]
+    if len(h.rows)>=2:
+        set_cell(h.rows[0].cells[1],meta.get("title","")); set_cell(h.rows[0].cells[3],meta.get("code",""))
+        set_cell(h.rows[1].cells[1],meta.get("setter","")); set_cell(h.rows[1].cells[3],meta.get("set",""))
+    t=d.tables[1]
+    while len(t.rows)>1: t._tbl.remove(t.rows[-1]._tr)
+    n=1
+    for pair in paper["descriptive"]:
+        for q in pair:
+            r=t.add_row().cells; set_cell(r[0],n); set_cell(r[1],f'a) {q["a"]["solution"]}\n\nb) {q["b"]["solution"]}'); set_cell(r[2],5); n+=1
+    o=io.BytesIO(); d.save(o); return o.getvalue()
+
 with st.sidebar:
-    sets=st.slider("Number of sets",1,4,1)
+    sets=st.slider("Number of sets",1,4,4)
     difficulty=st.selectbox("Difficulty",["Easy","Easy–Moderate","Moderate","Moderate–Hard"],1)
 
-t1,t2,t3=st.tabs(["1. Course & Sources","2. Generate & Review","3. Download"])
+t1,t2,t3,t4=st.tabs(["1. Course Setup","2. Sources & Templates","3. Generate & Review","4. Export"])
 with t1:
-    a,b=st.columns(2); title=a.text_input("Course title"); code=b.text_input("Course code")
+    a,b,c=st.columns(3); title=a.text_input("Course title"); code=b.text_input("Course code"); semester=c.text_input("Semester")
+    a,b,c=st.columns(3); year=a.text_input("Academic year"); scheme=b.text_input("Scheme",value="2025 Scheme"); branches=c.text_input("Branches",value="CAPT / CAFD")
+    a,b,c=st.columns(3); setter=a.text_input("QP setter / Faculty"); department=b.text_input("Department / Affiliation"); date=c.text_input("Date")
     co=st.text_area("Course Outcomes",height=140,placeholder="CO1 ...\nCO2 ...")
-    syllabus=st.file_uploader("Syllabus",["pdf","docx","txt"])
-    reference=st.file_uploader("Reference book / notes",["pdf","docx","txt"])
+
+with t2:
+    st.subheader("Source material")
+    syllabus=st.file_uploader("Syllabus",["pdf","docx","txt"],key="sy")
+    reference=st.file_uploader("Reference book / notes",["pdf","docx","txt"],key="ref")
+    st.subheader("University Word templates")
+    qp_template=st.file_uploader("Question Paper Template (.docx)",["docx"],key="qpt")
+    key_template=st.file_uploader("MCQ Answer Key Template (.docx)",["docx"],key="akt")
+    sol_template=st.file_uploader("Scheme & Solution Template (.docx)",["docx"],key="sot")
     if syllabus: st.session_state["syllabus"]=read_file(syllabus); st.success("Syllabus loaded.")
     if reference: st.session_state["reference"]=read_file(reference); st.success("Reference material loaded.")
 
-with t2:
+with t3:
     if st.button("Generate Question Papers",type="primary",use_container_width=True):
         if not st.session_state.get("syllabus") or not st.session_state.get("reference") or not co.strip():
             st.error("Enter COs and upload syllabus + reference material.")
         else:
             try:
                 units=split_units(st.session_state["syllabus"]); papers=[]; used=""; bar=st.progress(0)
-                for s in range(sets):
+                for sidx in range(sets):
                     mc=[]; desc=[]
                     for i,u in enumerate(units,1):
                         x=generate(i,u,st.session_state["reference"],co,difficulty,used)
                         for q in x["mcqs"]:
-                            q["unit"]=i; mc.append(q); used+="\n"+q["question"]
+                            q["unit"]=i; q.setdefault("po",""); mc.append(q); used+="\n"+q["question"]
                         desc.append(x["descriptive"])
-                        for q in x["descriptive"]: used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
-                    papers.append({"mcqs":balance(mc),"descriptive":desc}); bar.progress((s+1)/sets)
+                        for q in x["descriptive"]:
+                            q.setdefault("po",""); used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
+                    papers.append({"mcqs":balance(mc),"descriptive":desc}); bar.progress((sidx+1)/sets)
                 st.session_state["papers"]=papers; st.success("Generation complete.")
             except Exception as e: st.error(str(e))
     if st.session_state.get("papers"):
-        n=st.selectbox("Preview Set",range(1,len(st.session_state["papers"])+1))
-        p=st.session_state["papers"][n-1]
-        st.write(f"**{len(p['mcqs'])} MCQs generated.**")
+        n=st.selectbox("Review Set",range(1,len(st.session_state["papers"])+1)); p=st.session_state["papers"][n-1]
+        st.markdown("### MCQs")
         for i,q in enumerate(p["mcqs"],1):
-            with st.expander(f"Q{i}. {q['question']}"):
-                st.write("A)",q["options"]["A"]); st.write("B)",q["options"]["B"])
-                st.write("C)",q["options"]["C"]); st.write("D)",q["options"]["D"])
-                st.caption(f"Correct: {q['answer']} | {q.get('bt','')} | {q.get('co','')}")
+            with st.expander(f'Q{i}. {q["question"]}'):
+                q["question"]=st.text_area("Question",q["question"],key=f"q{n}_{i}")
+                cols=st.columns(4)
+                for j,L in enumerate("ABCD"): q["options"][L]=cols[j].text_input(L,q["options"][L],key=f"o{n}_{i}_{L}")
+                q["answer"]=st.selectbox("Correct answer",list("ABCD"),index=list("ABCD").index(q["answer"]),key=f"a{n}_{i}")
+        st.markdown("### Descriptive questions and solutions")
+        qn=1
+        for u,pair in enumerate(p["descriptive"],1):
+            for alt,q in enumerate(pair,1):
+                with st.expander(f"Question {qn} – Unit {u}"):
+                    q["a"]["question"]=st.text_area("a) Question",q["a"]["question"],key=f"daq{n}_{u}_{alt}")
+                    q["a"]["solution"]=st.text_area("a) Solution",q["a"]["solution"],height=110,key=f"das{n}_{u}_{alt}")
+                    q["b"]["question"]=st.text_area("b) Question",q["b"]["question"],key=f"dbq{n}_{u}_{alt}")
+                    q["b"]["solution"]=st.text_area("b) Solution",q["b"]["solution"],height=110,key=f"dbs{n}_{u}_{alt}")
+                qn+=1
 
-with t3:
-    if not st.session_state.get("papers"): st.info("Generate papers first.")
+with t4:
+    ps=st.session_state.get("papers",[])
+    if not ps: st.info("Generate papers first.")
+    elif not all([qp_template,key_template,sol_template]): st.info("Upload all three Word templates in Sources & Templates.")
     else:
-        if st.button("Prepare Download Package",type="primary",use_container_width=True):
-            out=io.BytesIO()
-            with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
-                for i,p in enumerate(st.session_state["papers"],1):
-                    z.writestr(f"Set_{i}/Question_Paper_Set_{i}.docx",make_qp_doc(p,title,code,i))
-                    z.writestr(f"Set_{i}/MCQ_Answer_Key_Set_{i}.docx",make_key_doc(p,title,code,i))
-                    z.writestr(f"Set_{i}/Scheme_Solution_Set_{i}.docx",make_sol_doc(p,title,code,i))
-            st.session_state["zip"]=out.getvalue()
+        if st.button("Build DOCX Package Using Uploaded Templates",type="primary",use_container_width=True):
+            try:
+                qb,kb,sb=get_bytes(qp_template),get_bytes(key_template),get_bytes(sol_template)
+                out=io.BytesIO()
+                with zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED) as z:
+                    for i,p in enumerate(ps,1):
+                        meta={"title":title,"code":code,"semester":semester,"year":year,"scheme":scheme,"branches":branches,"setter":setter,"department":department,"date":date,"set":str(i)}
+                        z.writestr(f"Set_{i}/Question_Paper_Set_{i}.docx",fill_qp_template(qb,p,meta))
+                        z.writestr(f"Set_{i}/MCQ_Answer_Key_Set_{i}.docx",fill_key_template(kb,p,meta))
+                        z.writestr(f"Set_{i}/Scheme_Solution_Set_{i}.docx",fill_sol_template(sb,p,meta))
+                st.session_state["zip"]=out.getvalue(); st.success("Template-based package ready.")
+            except Exception as e: st.error(f"Export failed: {e}")
         if st.session_state.get("zip"):
-            st.download_button("Download Question Papers + Keys + Solutions",st.session_state["zip"],
-                               "Question_Paper_Package.zip","application/zip",use_container_width=True)
+            st.download_button("Download All Sets",st.session_state["zip"],"Question_Paper_Package.zip","application/zip",use_container_width=True)
 
 st.divider()
-st.caption("Public Web v2 MVP • Review generated examination content before official use. AI usage is subject to the website owner's provider quota.")
+st.caption("Public Web v2.1 • Restores template uploads and template-based DOCX export from the local app.")
