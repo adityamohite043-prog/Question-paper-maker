@@ -1,24 +1,61 @@
-import io, json, re, zipfile, requests
+import io, json, re, zipfile, requests, time, logging
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document
 
 st.set_page_config(page_title="Question Paper Maker",page_icon="📝",layout="wide")
 st.title("📝 Question Paper Maker")
-st.caption("Public web version — generate question papers, MCQ keys and proper solutions from your own source material.")
+st.caption("Fast public web version — cached source reading, visible unit-by-unit progress, retries, and template-based export.")
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+@st.cache_data(show_spinner=False)
+def read_file_bytes(data, name):
+    """Extract source text once per unique uploaded file and cache it across reruns."""
+    low=name.lower()
+    bio=io.BytesIO(data)
+    if low.endswith(".pdf"):
+        reader=PdfReader(bio)
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    if low.endswith(".docx"):
+        d=Document(bio)
+        out=[p.text for p in d.paragraphs if p.text.strip()]
+        for t in d.tables:
+            for r in t.rows:
+                row=" | ".join(c.text.strip() for c in r.cells if c.text.strip())
+                if row: out.append(row)
+        return "\n".join(out)
+    return data.decode("utf-8",errors="ignore")
 
 def read_file(f):
     f.seek(0)
-    if f.name.lower().endswith(".pdf"):
-        return "\n".join((p.extract_text() or "") for p in PdfReader(f).pages)
-    if f.name.lower().endswith(".docx"):
-        d=Document(f); out=[p.text for p in d.paragraphs if p.text.strip()]
-        for t in d.tables:
-            for r in t.rows:
-                s=" | ".join(c.text.strip() for c in r.cells if c.text.strip())
-                if s: out.append(s)
-        return "\n".join(out)
-    return f.read().decode("utf-8",errors="ignore")
+    return read_file_bytes(f.read(), f.name)
+
+def relevant_reference(reference, unit, max_chunks=5):
+    """Select small reference chunks most related to the current unit instead of resending the whole book."""
+    text=re.sub(r"\s+"," ",reference).strip()
+    if len(text)<=18000:
+        return text
+    chunk_size=3200; overlap=300; chunks=[]
+    pos=0
+    while pos < len(text):
+        chunks.append(text[pos:pos+chunk_size])
+        pos += chunk_size-overlap
+    words=[w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{3,}",unit)]
+    stop={"unit","hours","general","purpose","design","operation","types","systems","system","aircraft","airplane","aeroplane","measurement","parameters"}
+    terms=[]
+    for w in words:
+        if w not in stop and w not in terms:
+            terms.append(w)
+    terms=terms[:35]
+    scored=[]
+    for i,ch in enumerate(chunks):
+        low=ch.lower()
+        score=sum(low.count(t) for t in terms)
+        scored.append((score,i,ch))
+    best=sorted(scored,key=lambda x:(-x[0],x[1]))[:max_chunks]
+    best=sorted(best,key=lambda x:x[1])
+    return "\n\n--- REFERENCE EXTRACT ---\n\n".join(x[2] for x in best)
 
 def split_units(text):
     m=list(re.finditer(r"(?im)\bunit\s*[-–:]?\s*(?:[ivx]+|\d+)\b",text))
@@ -29,24 +66,40 @@ def split_units(text):
         out.append(text[x.start():end].strip())
     return out
 
-def call_ai(prompt):
+def call_ai(prompt, attempts=3):
     key=st.secrets.get("GEMINI_API_KEY","")
-    model=st.secrets.get("GEMINI_MODEL","gemini-2.5-flash")
-    if not key: raise RuntimeError("Website owner has not configured the AI key.")
+    model=st.secrets.get("GEMINI_MODEL","gemini-3.6-flash")
+    if not key:
+        raise RuntimeError("Website owner has not configured the AI key.")
     url=f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     payload={"contents":[{"parts":[{"text":prompt}]}],
-             "generationConfig":{"temperature":0.25,"responseMimeType":"application/json"}}
-    r=requests.post(url,json=payload,timeout=240)
-    if not r.ok: raise RuntimeError(f"AI service error {r.status_code}: {r.text[:300]}")
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+             "generationConfig":{"temperature":0.2,"responseMimeType":"application/json","maxOutputTokens":8192}}
+    last=None
+    for attempt in range(1,attempts+1):
+        try:
+            r=requests.post(url,json=payload,timeout=(20,150))
+            if r.ok:
+                data=r.json()
+                candidates=data.get("candidates") or []
+                if not candidates:
+                    raise RuntimeError(f"AI returned no candidate: {str(data)[:400]}")
+                return candidates[0]["content"]["parts"][0]["text"]
+            last=f"AI service error {r.status_code}: {r.text[:500]}"
+            if r.status_code not in (429,500,502,503,504):
+                raise RuntimeError(last)
+        except requests.RequestException as e:
+            last=f"AI connection error: {e}"
+        if attempt < attempts:
+            time.sleep(2**attempt)
+    raise RuntimeError(last or "AI service did not respond.")
 
 def get_json(s):
     s=re.sub(r"^```(?:json)?\s*","",s.strip()); s=re.sub(r"\s*```$","",s)
     return json.loads(s)
 
 def generate(unit_no,unit,reference,co,difficulty,used):
-    # Keep prompt size practical for a public MVP.
-    ref=reference[:30000]
+    # Send only the reference excerpts most relevant to this unit.
+    ref=relevant_reference(reference,unit)
     prompt=f"""Act as a university examination question-paper setter.
 Use ONLY the supplied Unit syllabus and reference material. Do not add outside topics.
 Avoid questions already used. Difficulty: {difficulty}.
@@ -69,7 +122,13 @@ Return only valid JSON:
 {{"a":{{"question":"","marks":3,"solution":""}},"b":{{"question":"","marks":2,"solution":""}},"bt":"L3","co":"CO1"}}]}}"""
     d=get_json(call_ai(prompt))
     if len(d.get("mcqs",[]))!=10 or len(d.get("descriptive",[]))!=2:
-        raise ValueError("AI returned an incomplete unit. Please regenerate.")
+        raise ValueError("AI returned an incomplete unit. Please retry this set.")
+    for q in d["mcqs"]:
+        if str(q.get("answer","")).upper() not in "ABCD":
+            raise ValueError("AI returned an invalid MCQ answer key. Please retry this set.")
+        q["answer"]=str(q["answer"]).upper()
+        if not all(k in q.get("options",{}) for k in "ABCD"):
+            raise ValueError("AI returned incomplete MCQ options. Please retry this set.")
     return d
 
 def balance(qs):
@@ -145,7 +204,12 @@ def fill_qp_template(template_bytes, paper, meta):
     for i,q in enumerate(paper["mcqs"][:50]):
         r=i*3
         if r+2>=len(t2.rows): break
-        set_cell(t2.rows[r].cells[0],f"{i+1}."); set_cell(t2.rows[r].cells[1],q["question"])
+        set_cell(t2.rows[r].cells[0],f"{i+1}.")
+        try:
+            t2.rows[r].cells[1].merge(t2.rows[r].cells[4])
+        except Exception:
+            pass
+        set_cell(t2.rows[r].cells[1],q["question"])
         set_cell(t2.rows[r+1].cells[0],""); set_cell(t2.rows[r+1].cells[1],"A)"); set_cell(t2.rows[r+1].cells[2],q["options"]["A"]); set_cell(t2.rows[r+1].cells[3],"B)"); set_cell(t2.rows[r+1].cells[4],q["options"]["B"])
         set_cell(t2.rows[r+2].cells[0],""); set_cell(t2.rows[r+2].cells[1],"C)"); set_cell(t2.rows[r+2].cells[2],q["options"]["C"]); set_cell(t2.rows[r+2].cells[3],"D)"); set_cell(t2.rows[r+2].cells[4],q["options"]["D"])
     rows=[((1,2),(4,5)),((7,8),(10,11)),((13,14),(16,17)),((19,20),(22,23)),((25,26),(28,29))]
@@ -192,8 +256,12 @@ def fill_sol_template(template_bytes,paper,meta):
     o=io.BytesIO(); d.save(o); return o.getvalue()
 
 with st.sidebar:
-    sets=st.slider("Number of sets",1,4,4)
+    sets=st.slider("Target number of sets",1,4,1,help="For fastest generation, create one set at a time. You can continue later without losing completed sets.")
     difficulty=st.selectbox("Difficulty",["Easy","Easy–Moderate","Moderate","Moderate–Hard"],1)
+    if st.button("Start Fresh / Clear Generated Sets",use_container_width=True):
+        for k in ["papers","used_questions","zip"]:
+            st.session_state.pop(k,None)
+        st.rerun()
 
 t1,t2,t3,t4=st.tabs(["1. Course Setup","2. Sources & Templates","3. Generate & Review","4. Export"])
 with t1:
@@ -210,29 +278,57 @@ with t2:
     qp_template=st.file_uploader("Question Paper Template (.docx)",["docx"],key="qpt")
     key_template=st.file_uploader("MCQ Answer Key Template (.docx)",["docx"],key="akt")
     sol_template=st.file_uploader("Scheme & Solution Template (.docx)",["docx"],key="sot")
-    if syllabus: st.session_state["syllabus"]=read_file(syllabus); st.success("Syllabus loaded.")
-    if reference: st.session_state["reference"]=read_file(reference); st.success("Reference material loaded.")
+    if syllabus:
+        with st.spinner("Reading syllabus (cached after the first read)..."):
+            st.session_state["syllabus"]=read_file(syllabus)
+        st.success("Syllabus ready ✓")
+    if reference:
+        with st.spinner("Reading reference material (cached after the first read)..."):
+            st.session_state["reference"]=read_file(reference)
+        st.success("Reference material ready ✓")
 
 with t3:
-    if st.button("Generate Question Papers",type="primary",use_container_width=True):
+    existing=len(st.session_state.get("papers",[]))
+    st.caption(f"Completed sets in this session: {existing} / {sets}")
+    c1,c2=st.columns(2)
+    next_clicked=c1.button("Generate Next Set",type="primary",use_container_width=True,disabled=existing>=sets)
+    all_clicked=c2.button("Generate Up To Target",use_container_width=True,disabled=existing>=sets)
+    if next_clicked or all_clicked:
         if not st.session_state.get("syllabus") or not st.session_state.get("reference") or not co.strip():
             st.error("Enter COs and upload syllabus + reference material.")
         else:
             try:
-                units=split_units(st.session_state["syllabus"]); papers=[]; used=""; bar=st.progress(0)
-                for sidx in range(sets):
+                units=split_units(st.session_state["syllabus"])
+                papers=st.session_state.get("papers",[])
+                used=st.session_state.get("used_questions","")
+                target=min(sets, len(papers)+(1 if next_clicked else sets-len(papers)))
+                overall=st.progress(len(papers)/max(sets,1),text="Ready")
+                for sidx in range(len(papers),target):
                     mc=[]; desc=[]
-                    for i,u in enumerate(units,1):
-                        x=generate(i,u,st.session_state["reference"],co,difficulty,used)
-                        for q in x["mcqs"]:
-                            q["unit"]=i; q.setdefault("po",""); mc.append(q); used+="\n"+q["question"]
-                        desc.append(x["descriptive"])
-                        for q in x["descriptive"]:
-                            q.setdefault("po",""); used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
-                    papers.append({"mcqs":balance(mc),"descriptive":desc}); bar.progress((sidx+1)/sets)
-                st.session_state["papers"]=papers; st.success("Generation complete.")
-            except Exception as e: st.error(str(e))
+                    with st.status(f"Generating Set {sidx+1}...",expanded=True) as status:
+                        for i,u in enumerate(units,1):
+                            status.write(f"Unit {i}: selecting relevant reference material...")
+                            status.write(f"Unit {i}: generating questions and solutions...")
+                            x=generate(i,u,st.session_state["reference"],co,difficulty,used)
+                            for q in x["mcqs"]:
+                                q["unit"]=i; q.setdefault("po",""); mc.append(q); used+="\n"+q["question"]
+                            desc.append(x["descriptive"])
+                            for q in x["descriptive"]:
+                                q.setdefault("po",""); used+="\n"+q["a"]["question"]+"\n"+q["b"]["question"]
+                            status.write(f"Unit {i} complete ✓")
+                        paper={"mcqs":balance(mc),"descriptive":desc}
+                        papers.append(paper)
+                        st.session_state["papers"]=papers
+                        st.session_state["used_questions"]=used
+                        status.update(label=f"Set {sidx+1} complete ✓",state="complete",expanded=False)
+                    overall.progress(len(papers)/max(sets,1),text=f"{len(papers)} of {sets} set(s) complete")
+                st.success(f"Generation finished. {len(papers)} set(s) are ready for review.")
+            except Exception as e:
+                st.error(f"Generation stopped: {e}")
+                if st.session_state.get("papers"):
+                    st.info("Already completed sets were kept. Click Generate Next Set to continue.")
     if st.session_state.get("papers"):
+
         n=st.selectbox("Review Set",range(1,len(st.session_state["papers"])+1)); p=st.session_state["papers"][n-1]
         st.markdown("### MCQs")
         for i,q in enumerate(p["mcqs"],1):
@@ -273,4 +369,4 @@ with t4:
             st.download_button("Download All Sets",st.session_state["zip"],"Question_Paper_Package.zip","application/zip",use_container_width=True)
 
 st.divider()
-st.caption("Public Web v2.1 • Restores template uploads and template-based DOCX export from the local app.")
+st.caption("Public Web v2.2 Fast • Cached source extraction • unit-by-unit progress • automatic AI retries • one-set-at-a-time generation • template-based DOCX export.")
